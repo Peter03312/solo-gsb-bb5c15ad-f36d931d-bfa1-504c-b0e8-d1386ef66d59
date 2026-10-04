@@ -326,6 +326,29 @@ WHEN NEW.status = 'active' AND EXISTS (
 BEGIN
   SELECT RAISE(ABORT, '设备排班时段冲突（同设备生效排班不得重叠，首尾相接允许）');
 END;
+
+-- 一键预约 + 设备排班：批次号为整次操作幂等键（与普通预约共享批次号命名空间：
+-- auto_bookings.batch_no 与 reservations.batch_no 均唯一，跨表撞号由应用事务
+-- 拒绝）。创建时原子生成共用同一左闭右开时段的预约（reservations）与排班
+-- （schedules），本表只追加记录请求指纹与两项记录编号；原预约/排班的取消、
+-- 改派等接口语义不变，取消只更新其状态、本表行与批次号继续保留（同号同请求
+-- 重试永远返回原结果，即使预约/排班已取消或资源随后变化）。
+CREATE TABLE IF NOT EXISTS auto_bookings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_no TEXT NOT NULL UNIQUE,
+  reservation_id INTEGER NOT NULL,
+  schedule_id INTEGER NOT NULL,
+  publication_id INTEGER NOT NULL,
+  duration_seconds INTEGER NOT NULL,
+  search_start_utc TEXT NOT NULL,
+  search_end_utc TEXT NOT NULL,
+  device_nos_json TEXT NOT NULL,
+  chosen_device_no TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (reservation_id) REFERENCES reservations(id),
+  FOREIGN KEY (schedule_id) REFERENCES schedules(id),
+  FOREIGN KEY (publication_id) REFERENCES publications(id)
+);
 `;
 
 // 既有库平滑升级：runs 增加开始时冻结的校准依据列（老库无此列时补齐；
@@ -1113,4 +1136,42 @@ export function cancelActiveScheduleByReservation(db, reservationId, nowIso) {
     )
     .run(nowIso, active.id);
   return info.changes === 1 ? getScheduleRow(db, active.id) : null;
+}
+
+// ---------- 一键预约 + 设备排班（由 server 在单事务内调用） ----------
+
+export function getAutoBookingRow(db, id) {
+  return db.prepare('SELECT * FROM auto_bookings WHERE id = ?').get(id);
+}
+
+export function getAutoBookingRowByBatch(db, batchNo) {
+  return db.prepare('SELECT * FROM auto_bookings WHERE batch_no = ?').get(batchNo);
+}
+
+export function listAutoBookingRows(db) {
+  return db.prepare('SELECT * FROM auto_bookings ORDER BY id').all();
+}
+
+// 创建一键预约记录（预约与排班已在同事务内先行插入）。
+export function insertAutoBooking(db, b) {
+  const info = db
+    .prepare(
+      `INSERT INTO auto_bookings (
+         batch_no, reservation_id, schedule_id, publication_id,
+         duration_seconds, search_start_utc, search_end_utc,
+         device_nos_json, chosen_device_no
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      b.batchNo,
+      b.reservationId,
+      b.scheduleId,
+      b.publicationId,
+      b.durationSeconds,
+      b.searchStartUtc,
+      b.searchEndUtc,
+      JSON.stringify(b.deviceNos),
+      b.chosenDeviceNo,
+    );
+  return getAutoBookingRow(db, info.lastInsertRowid);
 }

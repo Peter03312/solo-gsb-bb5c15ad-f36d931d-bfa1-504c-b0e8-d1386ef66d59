@@ -100,6 +100,17 @@
 **不改写领还历史**（领用单冻结预约时段与占用量快照，实物编号与规格随单冻结）；
 领还冲突整体回滚，**不留部分记录**。
 
+实验人员可**一键预约并排班到设备**：提交**批次号、当前可用发布图、正整数秒时长、
+起点严格晚于服务端当前时刻的 UTC 搜索窗口**（左闭右开）及**非空且不重复的候选设备
+编号**，系统在窗口内找出**能完整容纳该时长的最早起点**——配重按**冻结装载图用量、
+当前库存、重叠生效预约与生效停用**逐时段核算，设备按**生效排班**逐时段核算（均为
+左闭右开、首尾相接可用）；同一最早起点多台设备可用时取**设备编号字典序最小**。
+提交时在**同一事务内重读全部依据**，**原子生成共用时段的预约与设备排班**，返回起止
+时间、设备与两项记录编号；**无可行时段、图已失效或输入非法时不留任何记录并说明
+原因**。批次号为**整次操作幂等键**：同号同请求重试返回原结果（**即使已取消或资源
+后来变化**），异请求或与既有普通预约撞号一律拒绝；生成的预约/排班完全沿用原接口
+语义（查询、取消、改派、运行联动均兼容）。
+
 ## 约束模型
 
 - 孔位编号 `0 … N-1`，孔位数 N 为 4–12 的偶数；孔 `i` 与孔 `i + N/2` 对径，孔 `i` 与孔 `(i+1)%N` 环形相邻。
@@ -292,12 +303,25 @@ npm test
     5. 查询（`GET /api/items`、`GET /api/checkouts`）展示实物状态、当前占用
        领用单、每单未还件与逾期状态；预约取消、库存调整及运行状态变化均不改写
        领还历史。
+16. **一键预约 + 设备排班**（HTTP API，见「一键预约 HTTP API 调用示例」）：
+    1. 提交批次号、当前可用发布图、正整数秒时长、起点严格晚于现在的 UTC 搜索
+       窗口与非空不重复的候选设备编号；系统在窗口内逐时段核算配重（冻结图用量 +
+       当前库存 + 重叠生效预约 + 生效停用）与候选设备生效排班，找出能完整容纳
+       时长的最早起点，并列时取设备编号字典序最小。
+    2. 提交在单事务内重读全部依据，原子生成共用同一时段的预约与排班，返回
+       起止时间、设备与预约/排班两项记录编号；无可行时段（`noFeasibleSlot`）、
+       窗口放不下时长（`windowTooShort`）、图已失效或输入非法均不留记录。
+    3. 批次号是整次操作幂等键：同号同请求重试永远返回原结果（即使预约/排班已
+       取消或库存、排班后来变化）；同号异请求或与普通预约撞号一律 409。
+    4. 生成的预约与排班沿用原接口语义：可在原列表查询、按原接口取消（预约取消
+       级联取消排班）、改派设备，并作为后续离心运行的预约/排班依据。
 
 ## REST API 摘要
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/state` | 当前录入数据（含避邻对与固定孔位）、数据指纹、草稿（含是否过期）、发布列表、核验列表、预约与停用列表、离心运行列表（`runs`）、设备保养状态列表（`devices`，含每台设备最新校准）、保养记录列表（`maintenances`）、设备校准记录列表（`calibrations`）、配重实物列表（`items`）、领用单列表（`checkouts`）与**设备排班列表（`schedules`，含取消/改派历史）** |
+| GET | `/api/state` | 当前录入数据（含避邻对与固定孔位）、数据指纹、草稿（含是否过期）、发布列表、核验列表、预约与停用列表、离心运行列表（`runs`）、设备保养状态列表（`devices`，含每台设备最新校准）、保养记录列表（`maintenances`）、设备校准记录列表（`calibrations`）、配重实物列表（`items`）、领用单列表（`checkouts`）与**设备排班列表（`schedules`，含取消/改派历史）、
+一键预约列表（`autoBookings`，含请求指纹与关联预约/排班当前状态）** |
 | PUT | `/api/config` | 整体替换转子配置（孔位数、容差、各孔最大承重），事务；缩小孔数使现有固定孔位越界时整次拒绝 |
 | PUT | `/api/tubes` | 整体替换全部离心管，事务，校验失败回滚；替换后若留下失效避邻对（对中管不再存在）或失效固定孔位（管不存在或孔位不再可用）拒绝并保留原数据 |
 | PUT | `/api/weights` | 整体替换全部配重规格，事务，校验失败回滚；库存缩减若使某规格数量低于其有效实物数（已登记未注销）则整次拒绝并保留原数据 |
@@ -349,6 +373,9 @@ npm test
 | GET | `/api/schedules` | 排班占用与列表：可按 `deviceNo`、`reservationId`、`from`/`to`（左闭右开，须成对）过滤；默认仅生效排班，`?status=cancelled|reassigned` 或 `?all=1` 含历史。返回 `devices[].segments`（设备在窗口内的分段占用，每段附 `schedules`）与 `schedules`；同时给出 `deviceNo`+`from`+`to` 时附 `probe`（`available` 与冲突明细 `conflicts`，含裁剪后重叠时段） |
 | GET | `/api/schedules/:id` | 单条排班详情（含 `phase`=`notStarted/ongoing/ended/cancelled/reassigned`、`usedByRun`、`cancellable`/`reassignable`、改派去向 `replacedById`）；不存在返回 404 |
 | POST | `/api/schedules/:id/cancel` | 取消排班（仅生效、预约未开始且未用于运行；历史保留、释放设备时段）；已取消/已改派重复调用幂等返回原记录；已开始/已用于运行 409（后者附 `existingRunId`）。预约取消时其生效排班被**同步取消**（预约取消响应附 `cancelledScheduleId`） |
+| POST | `/api/auto-bookings` | 一键预约 + 设备排班（批次号 + 当前可用发布图 + 正整数秒时长 + 起点严格晚于服务端当前时刻的 UTC 搜索窗口 + 非空不重复候选设备编号）：在窗口内找能完整容纳时长的**最早起点**（配重按冻结图用量/当前库存/重叠生效预约/生效停用逐时段核算，设备按生效排班逐时段核算，左闭右开首尾相接可用；并列取设备编号字典序最小），单事务重读依据并原子生成共用时段的预约与排班；201 新建（返回起止、`deviceNo`、`reservationId`、`scheduleId` 及两条记录视图）、200 同号同请求幂等重放（即使已取消或资源变化，不重新求解/占用）、400 非法输入/未知图/图已失效/窗口起点不晚于当前时刻、409 同号异请求（附 `existingId`）/与既有普通预约撞号（附 `existingReservationId`）/窗口放不下时长（`detail.reason=windowTooShort`）/无可行时段（`detail.reason=noFeasibleSlot`，附各候选起点配重冲突与设备占用明细 `detail.examined`）；任何失败不留记录 |
+| GET | `/api/auto-bookings` | 一键预约列表（请求指纹：时长、搜索窗口、候选设备；`startUtc`/`endUtc`/`deviceNo` 为求解结果；内嵌关联 `reservation` 与 `schedule` 的当前状态视图） |
+| GET | `/api/auto-bookings/:id` | 单条一键预约详情；不存在返回 404 |
 
 错误统一返回 `400 {"error","errors":[...]}`；状态冲突（草稿已存在、版本过期、核验已冻结、
 预约批次号冲突、配重数量不足等）返回 `409` 并附带 `existingId` / `currentVersion` 等字段。
@@ -667,6 +694,117 @@ curl -s -X POST $BASE/api/runs -H 'Content-Type: application/json' \
 `phase` 为 `notStarted`/`ongoing`/`ended`（生效排班相对当前时刻）或取消/改派状态本身；
 `usedByRun` 表示预约是否已用于运行（一旦用于运行，排班即锁定，不可取消或改派）。
 `GET /api/state` 的 `schedules` 字段包含全部排班（含历史）。
+
+## 一键预约 + 设备排班 HTTP API 调用示例
+
+一键预约把「找时段 → 建预约 → 排设备」合成一次原子操作。提交**批次号、当前可用
+发布图、正整数秒时长、起点严格晚于服务端当前时刻的 UTC 搜索窗口**（左闭右开）与
+**非空且不重复的候选设备编号**，系统在窗口内找出能完整容纳时长的最早起点：
+
+- **配重**：按冻结装载图用量、当前库存、重叠的生效预约与生效停用逐时段核算，
+  任一时刻「既有预约占用 + 停用 + 本次需求」不得超过当前库存；
+- **设备**：候选设备在该时段不得有重叠生效排班（首尾相接允许）；
+- 同一最早起点多台设备可用时，取**设备编号字典序最小**。
+
+提交时在同一事务内重读全部依据，原子生成共用同一时段的预约与排班。
+
+```bash
+BASE=http://localhost:8080
+
+# 1) 一键预约：201 成功，返回共用时段、设备与预约/排班两项记录编号
+curl -s -X POST $BASE/api/auto-bookings \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"AUTO-2026-001","publicationId":1,
+       "durationSeconds":3600,
+       "searchStartUtc":"2028-05-01T08:00:00Z",
+       "searchEndUtc":"2028-05-01T18:00:00Z",
+       "deviceNos":["CENT-09","CENT-01","CENT-02"]}'
+# -> 201 {"id":1,"batchNo":"AUTO-2026-001",
+#         "reservationId":11,"scheduleId":12,"publicationId":1,
+#         "durationSeconds":3600,
+#         "searchStartUtc":"2028-05-01T08:00:00.000Z",
+#         "searchEndUtc":"2028-05-01T18:00:00.000Z",
+#         "deviceNos":["CENT-01","CENT-02","CENT-09"],   # 已规范化排序
+#         "deviceNo":"CENT-01",                           # 字典序最小的可用设备
+#         "startUtc":"2028-05-01T08:00:00.000Z",
+#         "endUtc":"2028-05-01T09:00:00.000Z",
+#         "reservation":{...同 GET /api/reservations/:id 的完整视图...},
+#         "schedule":{...同 GET /api/schedules/:id 的完整视图...}}
+# 预约与排班共用 [startUtc, endUtc)；占用量按冻结图统计（如 50 g × 1）。
+
+# 2) 最早起点逐时段核算：配重/设备被占时自动后移，首尾相接即可用
+#    例：库存 1 且已有生效预约 [08:30,09:30)，候选设备均空闲
+#    → [08:00,09:00) 配重冲突，s=09:30 的 [09:30,10:30) 首尾相接 → 取 09:30
+curl -s -X POST $BASE/api/auto-bookings \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"AUTO-2026-002","publicationId":1,
+       "durationSeconds":3600,
+       "searchStartUtc":"2028-05-01T08:00:00Z",
+       "searchEndUtc":"2028-05-01T18:00:00Z",
+       "deviceNos":["CENT-01"]}'
+# -> 201 {"startUtc":"2028-05-01T09:30:00.000Z",
+#         "endUtc":"2028-05-01T10:30:00.000Z","deviceNo":"CENT-01", ...}
+
+# 3) 幂等：同批次号 + 同请求重试 → 200 返回原结果（不重新求解、不重新占用）
+curl -s -X POST $BASE/api/auto-bookings \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"AUTO-2026-001","publicationId":1,
+       "durationSeconds":3600,
+       "searchStartUtc":"2028-05-01T08:00:00Z",
+       "searchEndUtc":"2028-05-01T18:00:00Z",
+       "deviceNos":["CENT-09","CENT-01","CENT-02"]}'
+# -> 200 同一条记录（reservationId/scheduleId 不变）；
+#    即使之后预约被取消（级联取消排班）、库存调整或设备排班变化，
+#    同号同请求永远返回该原结果（reservation.status 可为 "cancelled"）。
+#    同号但任一字段不同（图/时长/窗口/候选设备集合）→ 409 {"existingId":1}
+
+# 4) 与既有普通预约撞号 → 409（批次号命名空间与普通预约共享）
+curl -s -X POST $BASE/api/auto-bookings \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"BATCH-001","publicationId":1,"durationSeconds":600,
+       "searchStartUtc":"2028-05-02T08:00:00Z","searchEndUtc":"2028-05-02T12:00:00Z",
+       "deviceNos":["CENT-01"]}'
+# -> 409 {"errors":["批次号「BATCH-001」已被普通预约 #7 使用，一键预约不能与既有预约撞号"],
+#         "existingReservationId":7}
+# 反向同理：一键预约占用的批次号再提交普通预约 → 409（预约批次冲突，existingId 指向
+# 该一键预约生成的预约）。
+
+# 5) 无可行时段 → 409，不留任何预约或排班记录；detail 说明原因与各候选起点
+curl -s -X POST $BASE/api/auto-bookings \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"AUTO-2026-009","publicationId":1,
+       "durationSeconds":3600,
+       "searchStartUtc":"2028-05-03T08:00:00Z",
+       "searchEndUtc":"2028-05-03T09:30:00Z",
+       "deviceNos":["CENT-01"]}'
+# -> 409 {"errors":["搜索窗口 ... 内不存在能完整容纳 3600 秒时长的时段（…），
+#                    未产生任何预约或排班：", ...],
+#         "detail":{"reason":"noFeasibleSlot","durationSeconds":3600,
+#                   "searchStartUtc":"...","searchEndUtc":"...","deviceNos":["CENT-01"],
+#                   "examined":[{"startUtc":"...","weightOk":false,
+#                                "capacityConflicts":[...同预约容量冲突结构...],
+#                                "freeDevices":[],"blockedDevices":[...]}]}}
+# 窗口本身放不下时长（窗口长度 < 时长）→ 409 detail.reason="windowTooShort"
+
+# 6) 非法输入 → 400，不留记录：
+#    空/重复候选设备编号、时长非正整数、非法时间或窗口起点不早于终点、
+#    窗口起点不晚于服务端当前时刻、未知发布图、图当前不可用（已失效）
+curl -s -X POST $BASE/api/auto-bookings \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"AUTO-BAD","publicationId":1,"durationSeconds":600,
+       "searchStartUtc":"2020-01-01T00:00:00Z","searchEndUtc":"2020-01-02T00:00:00Z",
+       "deviceNos":["CENT-01"]}'
+# -> 400 {"errors":["搜索窗口起点 2020-01-01T00:00:00.000Z 必须晚于服务端当前时刻 …"]}
+
+# 7) 生成的预约/排班沿用原接口语义（兼容）：
+curl -s $BASE/api/auto-bookings                 # 列表
+curl -s $BASE/api/auto-bookings/1               # 单条（404 表示不存在）
+curl -s -X POST $BASE/api/reservations/11/cancel
+# -> 预约取消（仅未开始）并级联取消其排班：{"id":11,"status":"cancelled",
+#    "cancelledScheduleId":12}；此后同号同请求重放一键预约仍返回原取消结果（200）
+curl -s -X POST $BASE/api/schedules/12/cancel   # 已随预约取消 → 幂等返回原取消记录
+# GET /api/state 的 autoBookings 字段包含全部一键预约记录
+```
 
 ## 配重块临时停用 HTTP API 调用示例
 
@@ -1028,15 +1166,19 @@ curl -s $BASE/api/items/1
 
 ```
 src/
-  server.js     Express 服务与路由、原子发布/核验/预约/停用/排班/运行/保养/校准/实物领还事务
+  server.js     Express 服务与路由、原子发布/核验/预约/停用/排班/运行/保养/校准/实物领还/
+                一键预约事务
   db.js         SQLite 连接、建表（含固定孔位表、离心运行表、设备上限/保养/校准表、
-                配重实物与领用单表、预约排班表（部分唯一索引+非重叠触发器））、数据访问
+                配重实物与领用单表、预约排班表（部分唯一索引+非重叠触发器）、
+                一键预约表）、数据访问
   solver.js     求解器（含避邻对与固定孔位约束）、独立复核、数据指纹（纯函数，含测试）
   verify.js     现场核验：录入规整、进度、完成判定（纯函数，含测试）
   reserve.js    时段预约与临时停用：UTC 解析、冻结图占用、双层扫描线（占用+停用）
                 容量判定与日程（纯函数，含测试）
   schedule.js   预约设备排班：提交规整、左闭右开设备时段重叠判定、设备占用扫描线
                 与可用探测（纯函数，含测试）
+  autobook.js   一键预约 + 设备排班：请求规整、窗口内最早可行起点枚举（配重容量 +
+                候选设备排班逐时段核算，并列取设备字典序最小）（纯函数，含测试）
   run.js        离心运行：开始/完结输入规整、左闭右开时段与超时判定（纯函数，含测试）
   maintenance.js 设备保养：上限/保养登记输入规整、累计运行时长汇总与待保养判定
                 （纯函数，含测试）
@@ -1048,6 +1190,6 @@ src/
 public/         浏览器界面（原生 HTML/CSS/JS，无需构建）
 test/           node --test 测试（求解器 + 避邻对 + 固定孔位 + HTTP API + 核验
                 + 时段预约 + 临时停用 + 预约设备排班 + 离心运行 + 设备保养 + 设备校准
-                + 配重实物领还，共 190 项）
+                + 配重实物领还 + 一键预约，共 212 项）
 Dockerfile / docker-compose.yml
 ```
