@@ -1,0 +1,12 @@
+node_modules
+data
+*.db
+*.db-*
+npm-debug.log
+.git
+.gitignore
+Dockerfile
+docker-compose.yml
+.dockerignore
+README.md
+test

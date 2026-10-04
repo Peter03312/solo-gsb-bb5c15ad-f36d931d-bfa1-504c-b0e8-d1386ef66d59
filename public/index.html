@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>离心转子配平</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <h1>离心转子配平</h1>
+    <div id="hashline" class="hashline"></div>
+  </header>
+
+  <div id="alert" class="alert hidden"></div>
+
+  <main>
+    <section class="card" id="sec-config">
+      <h2>1. 转子配置</h2>
+      <div class="form-row">
+        <label>孔位数（偶数，4–12）
+          <select id="holes"></select>
+        </label>
+        <label>允许对径差（g）
+          <input id="tolerance" type="number" step="0.0001" min="0" />
+        </label>
+      </div>
+      <div>
+        <h3>各孔最大质量（g）</h3>
+        <div id="holemax" class="holemax-grid"></div>
+      </div>
+      <div class="actions">
+        <button id="save-config" class="primary">保存转子配置</button>
+      </div>
+    </section>
+
+    <section class="card" id="sec-tubes">
+      <h2>2. 离心管（本次全部装入）</h2>
+      <div class="table-wrap">
+        <table id="tubes-table">
+          <thead>
+            <tr><th>编号</th><th>称重质量 (g)</th><th>可用孔位</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="actions">
+        <button id="add-tube">＋ 添加离心管</button>
+        <button id="save-tubes" class="primary">保存离心管并配平</button>
+      </div>
+    </section>
+
+    <section class="card" id="sec-exclusions">
+      <h2>3. 避邻对（同对两管不得占据相邻孔位）</h2>
+      <div class="muted" style="margin-bottom:10px">
+        环形孔位中孔 <code>i</code> 与孔 <code>(i+1) mod N</code> 相邻；同对离心管不得相邻。
+        按管编号维护，整体替换保存；未知编号、自配对、重复配对（含颠倒）将被整次拒绝。
+        删除离心管前须先解除涉及它的避邻对。未配置任何避邻对时，装载、发布、预约与核验流程与无规则一致。
+      </div>
+      <div class="table-wrap">
+        <table id="exclusions-table">
+          <thead>
+            <tr><th>离心管 A</th><th>离心管 B</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="actions">
+        <button id="add-exclusion">＋ 添加避邻对</button>
+        <button id="save-exclusions" class="primary">保存避邻对并配平</button>
+      </div>
+    </section>
+
+    <section class="card" id="sec-fixed">
+      <h2>4. 固定孔位（预摆离心管）</h2>
+      <div class="muted" style="margin-bottom:10px">
+        实验人员预先摆好部分离心管时，按「管编号 + 孔位」登记固定孔位，整组保存 / 修改 / 清空；
+        未知管、重复管或孔、越界孔、不在该管可用孔位内的绑定将被<b>整组拒绝</b>（原绑定保留）。
+        修改管的可用孔位或转子孔数使绑定失效时同样整次拒绝。
+        装载图必须将指定管放在固定孔位，并同时满足承重、对径差与避邻规则；
+        清空固定孔位后，流程与无固定孔位完全一致。
+      </div>
+      <div class="table-wrap">
+        <table id="fixed-table">
+          <thead>
+            <tr><th>离心管</th><th>固定孔位</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="actions">
+        <button id="add-fixed">＋ 添加固定孔位</button>
+        <button id="save-fixed" class="primary">保存固定孔位并配平</button>
+      </div>
+    </section>
+
+    <section class="card" id="sec-weights">
+      <h2>5. 可选配重块</h2>
+      <div class="table-wrap">
+        <table id="weights-table">
+          <thead>
+            <tr><th>质量 (g)</th><th>数量</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="actions">
+        <button id="add-weight">＋ 添加配重规格</button>
+        <button id="save-weights" class="primary">保存配重块并配平</button>
+      </div>
+    </section>
+
+    <section class="card" id="sec-draft">
+      <h2>6. 可行装载图（草稿）</h2>
+      <div id="draft-stale" class="banner warn hidden">
+        称重质量或配重数量已变化，此草稿基于旧数据，须点击「按当前数据重算」。
+      </div>
+      <div id="draft-none" class="muted">尚无草稿，保存数据后会自动计算，或点击下方按钮手动重算。</div>
+      <div id="draft-body" class="hidden"></div>
+      <div class="actions">
+        <button id="recompute">按当前数据重算</button>
+        <button id="publish" class="primary" disabled>发布并冻结此装载图</button>
+      </div>
+    </section>
+
+    <section class="card" id="sec-pubs">
+      <h2>7. 已发布装载图</h2>
+      <div id="pub-list"></div>
+    </section>
+
+    <section class="card" id="sec-verify">
+      <h2>8. 现场装载核验</h2>
+      <div class="muted" style="margin-bottom:10px">
+        选择上方「✓ 可用于当前装载」的发布记录，按孔位录入实际物件编号与实测质量（有限正数）；
+        空孔保持为空、质量 0。可随时暂存并恢复；同一发布记录只保留一份未完成核验。
+      </div>
+      <div id="verify-list"></div>
+    </section>
+
+    <section class="card" id="sec-reserve">
+      <h2>9. 配重块时段预约</h2>
+      <div class="muted" style="margin-bottom:10px">
+        以批次号预约「✓ 可用于当前装载」发布图所需的配重块；时段按 UTC
+        <b>左闭右开 [开始, 结束)</b> 计算，任一时刻同规格预约总量不得超过当前录入的可选数量。
+        同批次号同内容重复提交返回原记录，内容不同将被拒绝；仅未开始的预约可取消，取消后保留历史。
+      </div>
+      <div class="form-row">
+        <label>批次号
+          <input id="res-batch" type="text" placeholder="如 BATCH-2026-001" />
+        </label>
+        <label>依据发布图（仅当前可用）
+          <select id="res-pub"></select>
+        </label>
+        <label>开始时间（UTC）
+          <input id="res-start" type="datetime-local" step="60" />
+        </label>
+        <label>结束时间（UTC）
+          <input id="res-end" type="datetime-local" step="60" />
+        </label>
+      </div>
+      <div class="actions">
+        <button id="res-submit" class="primary">提交预约</button>
+      </div>
+      <div id="res-conflict"></div>
+      <h3>预约列表</h3>
+      <div id="res-list"></div>
+      <h3>占用日程（按当前库存判定；停用与「占用+停用」不足分区段展示）</h3>
+      <div id="res-schedule"></div>
+    </section>
+
+    <section class="card" id="sec-suspend">
+      <h2>10. 配重块临时停用</h2>
+      <div class="muted" style="margin-bottom:10px">
+        按质量规格登记停用数量、原因与 UTC 起止时间，时段按
+        <b>左闭右开 [开始, 结束)</b> 计算；同规格重叠停用量累加，任一时刻不得超过登记时
+        该规格的当前库存。停用<b>立即影响新预约</b>：预约时同时核对库存、生效停用与已有预约，
+        占用加停用超库存则整单拒绝。停用可与既有预约重叠，既有预约不改写。
+        仅未开始的停用可撤销，撤销留历史并释放后续容量。
+      </div>
+      <div class="form-row">
+        <label>质量规格（g，须为当前录入规格）
+          <select id="sus-mass"></select>
+        </label>
+        <label>停用数量
+          <input id="sus-qty" type="number" min="1" step="1" />
+        </label>
+        <label>原因
+          <input id="sus-reason" type="text" placeholder="如：送检校准 / 损坏待修" />
+        </label>
+        <label>开始时间（UTC）
+          <input id="sus-start" type="datetime-local" step="60" />
+        </label>
+        <label>结束时间（UTC）
+          <input id="sus-end" type="datetime-local" step="60" />
+        </label>
+      </div>
+      <div class="actions">
+        <button id="sus-submit" class="primary">登记停用</button>
+      </div>
+      <div id="sus-conflict"></div>
+      <h3>停用记录（含已撤销历史）</h3>
+      <div id="sus-list"></div>
+    </section>
+
+    <section class="card" id="sec-runs">
+      <h2>11. 离心运行</h2>
+      <div class="muted" style="margin-bottom:10px">
+        以<b>唯一运行编号 + 非空设备编号 + 已完成核验编号 + 预约编号</b>开始一次离心运行；
+        开始/结束时间由服务端记录。开始时在事务内确认：核验已通过、核验与生效预约指向
+        <b>同一张发布图</b>、发布图<b>当前可用</b>、当前时刻处于预约
+        <b>左闭右开 [开始, 结束)</b> 时段、该预约未被其他运行使用、同设备无进行中运行、
+        保养额度未达上限；<b>已有校准记录的设备还须最新校准合格且到期不早于预约终点</b>
+        （无校准记录的设备沿用原规则）；
+        任一冲突即拒绝且不留记录。开始后冻结发布图、核验结论、预约时段与校准依据；完结如实填写
+        「完成 / 中止」，超过预约终点完结会标记<b>超时</b>，随即释放设备，不改写预约与校准依据。
+        相同运行编号同内容重复提交返回原记录，异内容拒绝；完结同状态重放返回原结果。
+      </div>
+      <div class="form-row">
+        <label>运行编号（唯一）
+          <input id="run-no" type="text" placeholder="如 RUN-2026-001" />
+        </label>
+        <label>设备编号（非空）
+          <input id="run-device" type="text" placeholder="如 CENT-01" />
+        </label>
+        <label>已完成核验编号
+          <select id="run-ver"></select>
+        </label>
+        <label>预约编号（生效中）
+          <select id="run-res"></select>
+        </label>
+      </div>
+      <div class="actions">
+        <button id="run-start" class="primary">开始离心运行</button>
+      </div>
+      <div id="run-conflict"></div>
+      <h3>运行列表（含运行状态、超时标记与冻结依据）</h3>
+      <div id="run-list"></div>
+    </section>
+
+    <section class="card" id="sec-calib">
+      <h2>12. 设备校准（放行依据）</h2>
+      <div class="muted" style="margin-bottom:10px">
+        实验室按设备校准记录决定运行能否放行。登记时填写<b>唯一校准单号、设备编号、
+        校准时间、到期时间与合格/不合格结论</b>（时间均为 UTC）：校准时间须早于到期时间、
+        不得晚于服务端当前时刻，同设备校准时间须晚于上一条。记录<b>只追加</b>，按
+        <b>最新一条</b>判定。已有校准记录的设备开始运行时，须最新结论<b>合格</b>且到期时间
+        <b>不早于本次预约终点</b>；无校准记录的设备沿用原开始规则。开始成功后冻结校准依据，
+        之后新增记录、运行超时或完结不改写历史。同号同内容重放返回原记录，异内容拒绝。
+      </div>
+      <div class="form-row">
+        <label>校准单号（唯一）
+          <input id="calib-no" type="text" placeholder="如 CAL-2026-001" />
+        </label>
+        <label>设备编号
+          <input id="calib-device" type="text" list="known-devices" placeholder="如 CENT-01" />
+        </label>
+        <label>校准时间（UTC）
+          <input id="calib-at" type="datetime-local" step="1" />
+        </label>
+        <label>到期时间（UTC）
+          <input id="calib-expires" type="datetime-local" step="1" />
+        </label>
+        <label>校准结论
+          <select id="calib-passed">
+            <option value="true">合格</option>
+            <option value="false">不合格</option>
+          </select>
+        </label>
+      </div>
+      <div class="actions">
+        <button id="calib-submit" class="primary">登记校准记录</button>
+      </div>
+      <div id="calib-conflict"></div>
+      <h3>校准记录（按校准时间倒序，只追加）</h3>
+      <div id="calib-list"></div>
+    </section>
+
+    <section class="card" id="sec-maint">
+      <h2>13. 设备保养（按累计运行时长）</h2>
+      <div class="muted" style="margin-bottom:10px">
+        按设备编号设置<b>正整数秒数</b>的保养上限：系统统计<b>自最近一次保养后已完结运行</b>的
+        累计时长（完成 / 中止均按服务端起止时间计入，进行中不提前计入；尚无保养记录时计入
+        全部已完结运行），并给出剩余额度与待保养状态。运行即使越过上限也如实完结并释放设备；
+        达到上限后<b>新的运行将被拒绝</b>（未设置上限的设备不核对，沿用原行为）。
+        设备空闲时可凭<b>唯一保养单号 + 设备编号 + 原因</b>登记保养并开启新累计周期；
+        同号同内容重试返回原记录，异内容或设备运行中拒绝。调整上限仅影响后续开始判定，
+        不改写运行及保养历史。
+      </div>
+      <h3>设备状态</h3>
+      <div id="dev-list"></div>
+      <h3>设置 / 调整保养上限</h3>
+      <div class="form-row">
+        <label>设备编号
+          <input id="dev-limit-device" type="text" list="known-devices" placeholder="如 CENT-01" />
+        </label>
+        <label>保养上限（秒，正整数）
+          <input id="dev-limit-seconds" type="number" min="1" step="1" placeholder="如 3600" />
+        </label>
+      </div>
+      <div class="actions">
+        <button id="dev-limit-save" class="primary">保存上限（仅影响后续开始判定）</button>
+        <button id="dev-limit-clear" class="danger">清除该设备上限（恢复原行为）</button>
+      </div>
+      <h3>登记保养（设备空闲时开启新累计周期）</h3>
+      <div class="form-row">
+        <label>保养单号（唯一）
+          <input id="maint-no" type="text" placeholder="如 MAINT-2026-001" />
+        </label>
+        <label>设备编号
+          <input id="maint-device" type="text" list="known-devices" placeholder="如 CENT-01" />
+        </label>
+        <label>保养原因
+          <input id="maint-reason" type="text" placeholder="如：月度保养 / 更换轴承" />
+        </label>
+      </div>
+      <div class="actions">
+        <button id="maint-submit" class="primary">登记保养</button>
+      </div>
+      <div id="maint-conflict"></div>
+      <h3>保养记录</h3>
+      <div id="maint-list"></div>
+      <datalist id="known-devices"></datalist>
+    </section>
+  </main>
+
+  <dialog id="pub-dialog">
+    <div class="dialog-head">
+      <h3 id="pub-title"></h3>
+      <button id="pub-close" class="icon-btn">✕</button>
+    </div>
+    <div id="pub-detail"></div>
+  </dialog>
+
+  <dialog id="ver-dialog">
+    <div class="dialog-head">
+      <h3 id="ver-title"></h3>
+      <button id="ver-close" class="icon-btn">✕</button>
+    </div>
+    <div id="ver-detail"></div>
+  </dialog>
+
+  <dialog id="run-dialog">
+    <div class="dialog-head">
+      <h3 id="run-title"></h3>
+      <button id="run-detail-close" class="icon-btn">✕</button>
+    </div>
+    <div id="run-detail"></div>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+{
+  "name": "rotor-balance",
+  "version": "1.0.0",
+  "description": "实验室离心转子配平 Web 应用",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "express": "^4.21.2"
+  }
+}
