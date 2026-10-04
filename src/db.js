@@ -326,6 +326,33 @@ WHEN NEW.status = 'active' AND EXISTS (
 BEGIN
   SELECT RAISE(ABORT, '设备排班时段冲突（同设备生效排班不得重叠，首尾相接允许）');
 END;
+
+-- 找时段预约：提交批次号、发布图、正整数秒时长、UTC 搜索窗口与候选设备编号，
+-- 系统在窗口内找能完整容纳该时长的最早起点（并列取设备编号字典序最小），
+-- 并在同一事务内原子生成共用时段的预约与设备排班。
+-- batch_no 为整次操作的幂等键：同号同请求重试返回本表冻结的原结果（即使
+-- 预约之后被取消或资源变化），异请求拒绝；本操作生成的预约占用同一
+-- batch_no 命名空间（与既有普通预约撞号同样拒绝）。
+-- 请求与结果均随记录冻结：device_nos_json 为规范化（字典序排序）后的候选
+-- 设备编号，device_no/start_utc/end_utc/usage_json 为当选结果快照。
+CREATE TABLE IF NOT EXISTS bookings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_no TEXT NOT NULL UNIQUE,
+  publication_id INTEGER NOT NULL,
+  duration_seconds INTEGER NOT NULL CHECK (duration_seconds > 0),
+  window_start_utc TEXT NOT NULL,
+  window_end_utc TEXT NOT NULL,
+  device_nos_json TEXT NOT NULL,
+  device_no TEXT NOT NULL,
+  start_utc TEXT NOT NULL,
+  end_utc TEXT NOT NULL,
+  usage_json TEXT NOT NULL,
+  reservation_id INTEGER NOT NULL,
+  schedule_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (reservation_id) REFERENCES reservations(id),
+  FOREIGN KEY (schedule_id) REFERENCES schedules(id)
+);
 `;
 
 // 既有库平滑升级：runs 增加开始时冻结的校准依据列（老库无此列时补齐；
@@ -1113,4 +1140,45 @@ export function cancelActiveScheduleByReservation(db, reservationId, nowIso) {
     )
     .run(nowIso, active.id);
   return info.changes === 1 ? getScheduleRow(db, active.id) : null;
+}
+
+// ---------- 找时段预约（预约 + 排班整次操作；由 server 在单事务内调用） ----------
+
+export function getBookingRow(db, id) {
+  return db.prepare('SELECT * FROM bookings WHERE id = ?').get(id);
+}
+
+export function getBookingRowByBatch(db, batchNo) {
+  return db.prepare('SELECT * FROM bookings WHERE batch_no = ?').get(batchNo);
+}
+
+export function listBookingRows(db) {
+  return db.prepare('SELECT * FROM bookings ORDER BY id DESC').all();
+}
+
+// 写入整次操作的冻结记录（请求与当选结果快照；预约与排班已在同事务内生成）。
+export function insertBooking(db, b) {
+  const info = db
+    .prepare(
+      `INSERT INTO bookings
+         (batch_no, publication_id, duration_seconds, window_start_utc, window_end_utc,
+          device_nos_json, device_no, start_utc, end_utc, usage_json,
+          reservation_id, schedule_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      b.batchNo,
+      b.publicationId,
+      b.durationSeconds,
+      b.windowStartUtc,
+      b.windowEndUtc,
+      JSON.stringify(b.deviceNos),
+      b.deviceNo,
+      b.startUtc,
+      b.endUtc,
+      JSON.stringify(b.usage ?? []),
+      b.reservationId,
+      b.scheduleId,
+    );
+  return getBookingRow(db, info.lastInsertRowid);
 }

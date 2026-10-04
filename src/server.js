@@ -81,6 +81,10 @@ import {
   cancelSchedule,
   markScheduleReassigned,
   cancelActiveScheduleByReservation,
+  getBookingRow,
+  getBookingRowByBatch,
+  listBookingRows,
+  insertBooking,
 } from './db.js';
 import { solve, verify, computeHash } from './solver.js';
 import { normalizeEntries, measureProgress, verifyMeasurements } from './verify.js';
@@ -114,6 +118,11 @@ import {
   isoOccupancySegments,
   findDeviceConflicts,
 } from './schedule.js';
+import {
+  normalizeBookingInput,
+  weightFeasibleIntervals,
+  findEarliestSlot,
+} from './booking.js';
 import {
   normalizeLimitInput,
   normalizeDeviceNo,
@@ -176,6 +185,7 @@ export function createApp(db) {
       items: listItemRows(db).map(itemView),
       checkouts: listCheckoutRows(db).map((r) => checkoutView(r, Date.now())),
       schedules: listScheduleRows(db).map((r) => scheduleView(r, Date.now())),
+      bookings: listBookingRows(db).map(bookingView),
     });
   });
 
@@ -1080,6 +1090,268 @@ export function createApp(db) {
     } catch (e) {
       next(e);
     }
+  });
+
+  // ---------- 找时段预约（批次号幂等的「预约 + 设备排班」整次操作） ----------
+  //
+  // 实验人员提交批次号、当前可用的发布图、正整数秒时长、起点晚于服务端当前
+  // 时刻的 UTC 搜索窗口，以及非空且不重复的候选设备编号；系统在窗口内寻找
+  // 能完整容纳该时长的最早起点（并列时取设备编号字典序最小）。配重按冻结
+  // 装载图用量、当前库存、重叠的生效预约与生效停用逐时段核算，设备按生效
+  // 排班核算；均采用左闭右开 [start, end) 时段，首尾相接可用。
+  // 提交时在同一事务内重读依据（发布图可用性、库存、重叠预约/停用/排班），
+  // 原子生成共用时段的预约与设备排班，返回起止时间、设备及两项记录编号；
+  // 无可行时段、图已失效或输入非法时不留任何记录并说明原因。
+  // 批次号为整次操作的幂等键：同号同请求重试返回冻结的原结果（即使预约
+  // 之后被取消或资源变化），异请求或与既有普通预约撞号拒绝（409）。
+  // 生成的预约与排班是普通记录：取消、改派、运行等既有接口语义不变。
+
+  // 视图：完全来自冻结记录（重放不依赖预约/排班当前状态）
+  function bookingView(row) {
+    return {
+      id: row.id,
+      batchNo: row.batch_no,
+      publicationId: row.publication_id,
+      durationSeconds: row.duration_seconds,
+      windowStartUtc: row.window_start_utc,
+      windowEndUtc: row.window_end_utc,
+      deviceNos: JSON.parse(row.device_nos_json),
+      deviceNo: row.device_no,
+      startUtc: row.start_utc,
+      endUtc: row.end_utc,
+      usage: JSON.parse(row.usage_json),
+      reservationId: row.reservation_id,
+      scheduleId: row.schedule_id,
+      createdAt: row.created_at,
+    };
+  }
+
+  // 提交找时段预约：201 新建；200 同号同请求幂等重放（返回冻结的原结果）；
+  // 400 非法输入（含窗口起点不晚于服务端当前时刻）/未知或不可用发布图；
+  // 409 无可行时段（detail 附配重冲突时段与各候选设备占用）或批次号冲突。
+  app.post('/api/bookings', (req, res, next) => {
+    try {
+      const { errors, clean } = normalizeBookingInput(req.body);
+      if (errors.length) throw new ValidationError(errors);
+      const { batchNo, publicationId, durationSeconds, windowStartMs, windowEndMs, deviceNos } =
+        clean;
+      const windowStartUtc = toIso(windowStartMs);
+      const windowEndUtc = toIso(windowEndMs);
+      const durationMs = durationSeconds * 1000;
+      // 候选设备编号按字典序规范化存储：同一组设备（次序不同）视为同一请求
+      const deviceNosSorted = [...deviceNos].sort();
+
+      let status = 201;
+      let view;
+      const tx = db.transaction(() => {
+        // 幂等：批次号为整次操作的键——同号同请求返回冻结的原结果（即使预约
+        // 之后被取消或资源变化），同号异请求拒绝；与既有普通预约撞号同样拒绝。
+        const existingBooking = getBookingRowByBatch(db, batchNo);
+        if (existingBooking) {
+          const same =
+            existingBooking.publication_id === publicationId &&
+            existingBooking.duration_seconds === durationSeconds &&
+            existingBooking.window_start_utc === windowStartUtc &&
+            existingBooking.window_end_utc === windowEndUtc &&
+            JSON.stringify(JSON.parse(existingBooking.device_nos_json)) ===
+              JSON.stringify(deviceNosSorted);
+          if (!same) {
+            throw new ConflictError(
+              [`批次号「${batchNo}」已被找时段预约 #${existingBooking.id} 使用且请求内容不同，拒绝重复提交`],
+              { existingId: existingBooking.id },
+            );
+          }
+          view = bookingView(existingBooking);
+          status = 200;
+          return;
+        }
+        const existingReservation = getReservationRowByBatch(db, batchNo);
+        if (existingReservation) {
+          throw new ConflictError(
+            [
+              `批次号「${batchNo}」已被预约 #${existingReservation.id} 使用` +
+                '（批次号在全部预约中唯一），请更换批次号',
+            ],
+            { existingId: existingReservation.id },
+          );
+        }
+
+        // 搜索窗口起点须晚于服务端当前时刻（事务内取时，只搜索未来时段）
+        const nowMs = Date.now();
+        if (!(windowStartMs > nowMs)) {
+          throw new ValidationError([
+            `搜索窗口起点 ${windowStartUtc} 必须晚于服务端当前时刻 ${toIso(nowMs)}（只搜索未来时段）`,
+          ]);
+        }
+
+        // 原子重读依据：发布图存在、可行且当前可用（数据指纹与当前录入一致）
+        const pub = getPublication(db, publicationId);
+        if (!pub) {
+          throw new ValidationError([`发布记录 #${publicationId} 不存在（未知装载图）`]);
+        }
+        if (!pub.feasible) {
+          throw new ValidationError([
+            `发布记录 #${publicationId} 不含可行装载图，不能用于预约`,
+          ]);
+        }
+        const hash = currentHash(db);
+        if (hash === null || pub.basisHash !== hash) {
+          throw new ValidationError([
+            `发布记录 #${publicationId} 当前不可用于装载（录入数据已变化），请选择仍可用的发布记录`,
+          ]);
+        }
+
+        const data = loadData(db);
+        const capacityOf = (mass) => {
+          const w = data.weights.find((x) => x.mass === mass);
+          return w ? w.quantity : 0;
+        };
+        const usage = planUsage(pub);
+
+        // 窗口内重叠的生效预约与生效停用（左闭右开）
+        const overlapping = listOverlappingActiveReservations(db, windowStartUtc, windowEndUtc).map(
+          (r) => ({
+            startMs: Date.parse(r.start_utc),
+            endMs: Date.parse(r.end_utc),
+            usage: JSON.parse(r.usage_json),
+          }),
+        );
+        const suspOverlap = listOverlappingActiveSuspensions(db, windowStartUtc, windowEndUtc).map(
+          (sp) => ({
+            startMs: Date.parse(sp.start_utc),
+            endMs: Date.parse(sp.end_utc),
+            mass: sp.mass,
+            count: sp.quantity,
+          }),
+        );
+
+        // 配重逐时段核算：每种占用规格「既有占用 + 停用 ≤ 当前库存 − 本次需求」
+        // 的时段求交，得到配重可行区间
+        const specs = usage.map((u) => ({
+          required: u.count,
+          capacity: capacityOf(u.mass),
+          usedIntervals: overlapping
+            .map((r) => {
+              const ru = r.usage.find((x) => x.mass === u.mass);
+              return ru && ru.count > 0
+                ? { startMs: r.startMs, endMs: r.endMs, count: ru.count }
+                : null;
+            })
+            .filter(Boolean),
+          suspendedIntervals: suspOverlap
+            .filter((sp) => sp.mass === u.mass && sp.count > 0)
+            .map((sp) => ({ startMs: sp.startMs, endMs: sp.endMs, count: sp.count })),
+        }));
+        const weightOk = weightFeasibleIntervals(specs, windowStartMs, windowEndMs);
+
+        // 设备按生效排班核算（窗口内占用；左闭右开，首尾相接可用）
+        const devices = deviceNos.map((deviceNo) => ({
+          deviceNo,
+          busy: listOverlappingActiveSchedulesByDevice(
+            db,
+            deviceNo,
+            windowStartUtc,
+            windowEndUtc,
+          ).map((r) => ({
+            startMs: Date.parse(r.start_utc),
+            endMs: Date.parse(r.end_utc),
+          })),
+        }));
+
+        const slot = findEarliestSlot({
+          windowStartMs,
+          windowEndMs,
+          durationMs,
+          weightOk,
+          devices,
+        });
+        if (!slot) {
+          // 诊断：配重容量不足时段（与普通预约 409 同构）+ 各候选设备窗口内占用
+          const capCheck = checkCapacity({
+            usage,
+            capacityOf,
+            overlapping,
+            suspensions: suspOverlap,
+            startMs: windowStartMs,
+            endMs: windowEndMs,
+          });
+          const errs = [
+            `搜索窗口 ${windowStartUtc} 至 ${windowEndUtc} 内没有能完整容纳 ` +
+              `${durationSeconds} 秒时长的可行时段（配重容量与候选设备排班综合判定），` +
+              '未产生任何记录',
+          ];
+          if (capCheck.conflicts.length) {
+            errs.push('配重容量不足时段：');
+            for (const c of capCheck.conflicts) {
+              for (const w of c.windows) {
+                errs.push(
+                  `规格 ${c.mass} g：${w.start} 至 ${w.end} 已预约占用 ${w.used} 枚、` +
+                    `临时停用 ${w.suspended} 枚，本次需 ${c.required} 枚，` +
+                    `合计超出当前库存 ${c.capacity} 枚`,
+                );
+              }
+            }
+          }
+          throw new ConflictError(errs, {
+            detail: {
+              reason: 'noFeasibleSlot',
+              window: { startUtc: windowStartUtc, endUtc: windowEndUtc, durationSeconds },
+              weightConflicts: capCheck.conflicts,
+              deviceBusy: devices.map((d) => ({
+                deviceNo: d.deviceNo,
+                busy: d.busy.map((b) => ({ start: toIso(b.startMs), end: toIso(b.endMs) })),
+              })),
+            },
+          });
+        }
+
+        // 同一事务内原子生成共用时段的预约与设备排班（触发器兜底设备非重叠）
+        const startUtc = toIso(slot.startMs);
+        const endUtc = toIso(slot.endMs);
+        const resRow = insertReservation(db, {
+          batchNo,
+          publicationId,
+          startUtc,
+          endUtc,
+          usage,
+        });
+        const schRow = insertSchedule(db, {
+          reservationId: resRow.id,
+          deviceNo: slot.deviceNo,
+          startUtc,
+          endUtc,
+        });
+        const booking = insertBooking(db, {
+          batchNo,
+          publicationId,
+          durationSeconds,
+          windowStartUtc,
+          windowEndUtc,
+          deviceNos: deviceNosSorted,
+          deviceNo: slot.deviceNo,
+          startUtc,
+          endUtc,
+          usage,
+          reservationId: resRow.id,
+          scheduleId: schRow.id,
+        });
+        view = bookingView(booking);
+      });
+      tx();
+      res.status(status).json(view);
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  app.get('/api/bookings', (req, res) => {
+    res.json(listBookingRows(db).map(bookingView));
+  });
+
+  app.get('/api/bookings/:id', (req, res) => {
+    const row = getBookingRow(db, Number(req.params.id));
+    if (!row) return res.status(404).json({ error: '找时段预约记录不存在' });
+    res.json(bookingView(row));
   });
 
   // ---------- 配重块临时停用 ----------

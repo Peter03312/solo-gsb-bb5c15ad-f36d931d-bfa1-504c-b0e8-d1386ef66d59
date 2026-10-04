@@ -100,6 +100,14 @@
 **不改写领还历史**（领用单冻结预约时段与占用量快照，实物编号与规格随单冻结）；
 领还冲突整体回滚，**不留部分记录**。
 
+实验人员可提交**找时段预约**：凭**批次号 + 当前可用的发布图 + 正整数秒时长 + UTC 搜索窗口**
+（窗口起点须**晚于服务端当前时刻**）请求系统在窗口内寻找能完整容纳该时长的**最早可行起点**
+（同一最早起点有多台候选设备时取**设备编号字典序最小**者），并在**同一事务**内原子生成
+**共用时段的预约与设备排班**；配重按冻结图用量、当前库存、重叠生效预约与停用**逐时段核算**，
+设备按生效排班核算（均**左闭右开**，首尾相接可用）。批次号为整次操作幂等键：
+同号同请求重放返回**原冻结结果**（即使预约已取消或资源后来变化），异请求或与既有
+普通预约撞号拒绝；无可行时段、图已失效或输入非法时**不留任何记录**并说明原因。
+
 ## 约束模型
 
 - 孔位编号 `0 … N-1`，孔位数 N 为 4–12 的偶数；孔 `i` 与孔 `i + N/2` 对径，孔 `i` 与孔 `(i+1)%N` 环形相邻。
@@ -292,6 +300,16 @@ npm test
     5. 查询（`GET /api/items`、`GET /api/checkouts`）展示实物状态、当前占用
        领用单、每单未还件与逾期状态；预约取消、库存调整及运行状态变化均不改写
        领还历史。
+16. **找时段预约**（HTTP API，见「找时段预约 HTTP API 调用示例」）：
+    1. 提交批次号、当前可用发布图编号、正整数秒时长与 UTC 搜索窗口
+       （窗口起点须**晚于服务端当前时刻**）；
+    2. 系统在窗口内找**能完整容纳该时长的最早起点**（并列取设备编号字典序最小），
+       同一事务内原子生成**共用时段的预约与设备排班**；
+    3. 配重按冻结图用量、当前库存、重叠生效预约与停用逐时段核算，
+       设备按生效排班核算（左闭右开，首尾相接可用）；
+    4. 同批次号同请求重放返回原冻结结果（即使预约已取消或资源后来变化），
+       异请求或与既有普通预约撞号拒绝；
+    5. 无可行时段、图已失效或输入非法时不留任何记录并说明原因。
 
 ## REST API 摘要
 
@@ -349,6 +367,9 @@ npm test
 | GET | `/api/schedules` | 排班占用与列表：可按 `deviceNo`、`reservationId`、`from`/`to`（左闭右开，须成对）过滤；默认仅生效排班，`?status=cancelled|reassigned` 或 `?all=1` 含历史。返回 `devices[].segments`（设备在窗口内的分段占用，每段附 `schedules`）与 `schedules`；同时给出 `deviceNo`+`from`+`to` 时附 `probe`（`available` 与冲突明细 `conflicts`，含裁剪后重叠时段） |
 | GET | `/api/schedules/:id` | 单条排班详情（含 `phase`=`notStarted/ongoing/ended/cancelled/reassigned`、`usedByRun`、`cancellable`/`reassignable`、改派去向 `replacedById`）；不存在返回 404 |
 | POST | `/api/schedules/:id/cancel` | 取消排班（仅生效、预约未开始且未用于运行；历史保留、释放设备时段）；已取消/已改派重复调用幂等返回原记录；已开始/已用于运行 409（后者附 `existingRunId`）。预约取消时其生效排班被**同步取消**（预约取消响应附 `cancelledScheduleId`） |
+| POST | `/api/bookings` | 找时段预约（`batchNo` 批次号 + `publicationId` 发布图编号 + `durationSeconds` 正整数秒时长 + `windowStartUtc`/`windowEndUtc` UTC 搜索窗口 + `deviceNos` 候选设备编号数组；窗口起点须**晚于服务端当前时刻**）。事务内重读冻结图/当前库存/重叠预约与停用/设备排班，找窗口内**能完整容纳时长的最早起点**（并列取设备编号字典序最小），原子生成**共用时段的预约与设备排班**；201 新建、200 同号同请求幂等重放（返回原冻结结果）、400 非法输入/图不可用/窗口不合法、409 无可行时段（附 `detail.conflicts` 冲突规格与时段）或批次号撞号（附 `existingId`） |
+| GET | `/api/bookings` | 找时段预约列表（批次号、发布图、时长、搜索窗口、当选设备与时段、关联预约/排班编号、状态） |
+| GET | `/api/bookings/:id` | 单条找时段预约详情（含冻结的搜索窗口与当选结果）；不存在返回 404 |
 
 错误统一返回 `400 {"error","errors":[...]}`；状态冲突（草稿已存在、版本过期、核验已冻结、
 预约批次号冲突、配重数量不足等）返回 `409` 并附带 `existingId` / `currentVersion` 等字段。
@@ -1024,6 +1045,92 @@ curl -s "$BASE/api/items?mass=50"
 curl -s $BASE/api/items/1
 ```
 
+## 找时段预约 HTTP API 调用示例
+
+找时段预约把「找窗口 + 建预约 + 建排班」合并为一次原子操作：提交批次号、
+当前可用发布图、正整数秒时长与 UTC 搜索窗口（窗口起点须**晚于服务端当前时刻**），
+系统在窗口内找**能完整容纳该时长的最早起点**（同一最早起点多台候选设备可行时，
+取**设备编号字典序最小**者），并在**同一事务**内生成**共用时段的预约与设备排班**。
+配重按冻结图用量、当前库存、重叠生效预约与停用**逐时段核算**，设备按生效排班核算
+（均**左闭右开**，首尾相接可用）。批次号为整次操作幂等键。
+
+```bash
+BASE=http://localhost:8080
+
+# 0) 前置：当前可用发布图 #1（冻结占用 50 g × 1）、库存 50 g × 2、
+#    候选设备 CENT-01 / CENT-02（均无排班）
+
+# 1) 提交找时段预约：201 新建；窗口起点须晚于服务端当前时刻
+curl -s -X POST $BASE/api/bookings \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"BK-001","publicationId":1,"durationSeconds":3600,
+       "windowStartUtc":"2026-10-05T08:00:00Z","windowEndUtc":"2026-10-05T20:00:00Z",
+       "deviceNos":["CENT-01","CENT-02"]}'
+# -> 201 {"id":1,"batchNo":"BK-001","publicationId":1,"durationSeconds":3600,
+#         "windowStartUtc":"2026-10-05T08:00:00.000Z","windowEndUtc":"2026-10-05T20:00:00.000Z",
+#         "deviceNos":["CENT-01","CENT-02"],"deviceNo":"CENT-01",
+#         "startUtc":"2026-10-05T08:00:00.000Z","endUtc":"2026-10-05T09:00:00.000Z",
+#         "usage":[{"mass":50,"count":1}],"reservationId":1,"scheduleId":1,
+#         "createdAt":"2026-10-04T09:00:00.000Z"}
+#    说明：窗口 [08:00, 20:00) 内 CENT-01 与 CENT-02 均在 08:00 可行，
+#    并列时取设备编号字典序最小 → CENT-01；时段 [08:00, 09:00) 与窗口起点相接。
+
+# 2) 幂等：同批次号同请求重放 → 200 返回原冻结结果（即使预约已取消或资源后来变化）
+curl -s -X POST $BASE/api/bookings \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"BK-001","publicationId":1,"durationSeconds":3600,
+       "windowStartUtc":"2026-10-05T08:00:00Z","windowEndUtc":"2026-10-05T20:00:00Z",
+       "deviceNos":["CENT-01","CENT-02"]}'
+# -> 200 同上（不新增记录；候选设备次序不同视为同一请求）
+
+# 3) 同批次号异请求 → 409（附 existingId）
+curl -s -X POST $BASE/api/bookings \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"BK-001","publicationId":1,"durationSeconds":7200,
+       "windowStartUtc":"2026-10-05T08:00:00Z","windowEndUtc":"2026-10-05T20:00:00Z",
+       "deviceNos":["CENT-01","CENT-02"]}'
+# -> 409 {"errors":["批次号「BK-001」已被找时段预约 #1 使用且请求内容不同，拒绝重复提交"],
+#         "existingId":1}
+
+# 4) 与既有普通预约撞号 → 409（附 existingId）
+curl -s -X POST $BASE/api/bookings \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"BATCH-001","publicationId":1,"durationSeconds":600,
+       "windowStartUtc":"2026-10-06T08:00:00Z","windowEndUtc":"2026-10-06T20:00:00Z",
+       "deviceNos":["CENT-01"]}'
+# -> 409 {"errors":["批次号「BATCH-001」已被预约 #1 使用（批次号在全部预约中唯一），请更换批次号"],
+#         "existingId":1}
+
+# 5) 无可行时段 → 409（detail.conflicts 给出冲突规格与时段；不留任何记录）
+curl -s -X POST $BASE/api/bookings \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"BK-002","publicationId":1,"durationSeconds":3600,
+       "windowStartUtc":"2026-10-05T08:00:00Z","windowEndUtc":"2026-10-05T09:00:00Z",
+       "deviceNos":["CENT-01"]}'
+# -> 409 {"errors":["搜索窗口 2026-10-05T08:00:00.000Z 至 2026-10-05T09:00:00.000Z 内
+#                   没有能完整容纳 3600 秒时长的可行时段（配重容量与候选设备排班综合判定），
+#                   未产生任何记录",
+#                   "配重容量不足时段：",
+#                   "规格 50 g：… 已预约占用 1 枚、临时停用 0 枚，本次需 1 枚，合计超出当前库存 2 枚"],
+#         "detail":{"reason":"noFeasibleSlot",
+#                    "window":{"startUtc":"…","endUtc":"…","durationSeconds":3600},
+#                    "weightConflicts":[{"mass":50,"required":1,"capacity":2,"peak":1,
+#                      "windows":[{"start":"…","end":"…","used":1,"suspended":0}]}],
+#                    "deviceBusy":[{"deviceNo":"CENT-01","busy":[{"start":"…","end":"…"}]}]}}
+
+# 6) 非法输入 → 400（不留记录）：窗口起点不晚于服务端当前时刻 / 图不可用 / 时长非正整数
+curl -s -X POST $BASE/api/bookings \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"BK-003","publicationId":1,"durationSeconds":0,
+       "windowStartUtc":"2026-10-05T08:00:00Z","windowEndUtc":"2026-10-05T20:00:00Z",
+       "deviceNos":["CENT-01"]}'
+# -> 400 {"errors":["时长 durationSeconds 必须是正整数（单位：秒）"]}
+
+# 7) 列表 / 单条
+curl -s $BASE/api/bookings
+curl -s $BASE/api/bookings/1
+```
+
 ## 目录结构
 
 ```
@@ -1037,6 +1144,8 @@ src/
                 容量判定与日程（纯函数，含测试）
   schedule.js   预约设备排班：提交规整、左闭右开设备时段重叠判定、设备占用扫描线
                 与可用探测（纯函数，含测试）
+  booking.js    找时段预约：输入规整、区间代数（求交/求差）、配重可行区间与
+                最早可行起点搜索（纯函数，含测试）
   run.js        离心运行：开始/完结输入规整、左闭右开时段与超时判定（纯函数，含测试）
   maintenance.js 设备保养：上限/保养登记输入规整、累计运行时长汇总与待保养判定
                 （纯函数，含测试）
@@ -1047,7 +1156,7 @@ src/
   validate.js   输入校验（非法质量/重复编号/越界/避邻对/固定孔位）、400/409 错误类型
 public/         浏览器界面（原生 HTML/CSS/JS，无需构建）
 test/           node --test 测试（求解器 + 避邻对 + 固定孔位 + HTTP API + 核验
-                + 时段预约 + 临时停用 + 预约设备排班 + 离心运行 + 设备保养 + 设备校准
-                + 配重实物领还，共 190 项）
+                + 时段预约 + 临时停用 + 预约设备排班 + 找时段预约 + 离心运行
+                + 设备保养 + 设备校准 + 配重实物领还，共 208 项）
 Dockerfile / docker-compose.yml
 ```
